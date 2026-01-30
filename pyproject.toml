@@ -82,7 +82,7 @@ dependencies = [
 
     "draccus==0.10.0", # TODO: Remove ==
     "gymnasium>=1.1.1,<2.0.0",
-    "rerun-sdk>=0.24.0,<0.28.0", # Relaxed version to be compatible with isaaclab
+    "rerun-sdk>=0.24.0,<0.29.0", # Relaxed version to be compatible with isaaclab
 
     # Support dependencies
     "deepdiff>=7.0.1,<9.0.0",
