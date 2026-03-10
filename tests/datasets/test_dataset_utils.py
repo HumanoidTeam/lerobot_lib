@@ -57,6 +57,18 @@ def test_calculate_episode_data_index():
     assert torch.equal(episode_data_index["to"], torch.tensor([2, 3, 6]))
 
 
+def test_hf_transform_to_torch_replaces_nested_none_with_zero():
+    batch = {
+        "observation.state.ft_left": [[None, None, None, None, None, None]],
+        "observation.state.ft_right": [[1.0, None, 3.0, None, 5.0, None]],
+    }
+
+    out = hf_transform_to_torch(batch)
+
+    assert torch.equal(out["observation.state.ft_left"][0], torch.zeros(6))
+    assert torch.equal(out["observation.state.ft_right"][0], torch.tensor([1.0, 0.0, 3.0, 0.0, 5.0, 0.0]))
+
+
 def test_merge_simple_vectors():
     g1 = {
         ACTION: {

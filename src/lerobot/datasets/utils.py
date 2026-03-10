@@ -423,6 +423,15 @@ def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[to
     Returns:
         dict: The batch with items converted to torch tensors.
     """
+    def _sanitize_none(value: Any) -> Any:
+        if isinstance(value, list):
+            return [_sanitize_none(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_sanitize_none(item) for item in value)
+        if value is None:
+            return 0.0
+        return value
+
     for key in items_dict:
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
@@ -431,7 +440,9 @@ def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[to
         elif first_item is None:
             pass
         else:
-            items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+            items_dict[key] = [
+                x if isinstance(x, str) else torch.tensor(_sanitize_none(x)) for x in items_dict[key]
+            ]
     return items_dict
 
 
