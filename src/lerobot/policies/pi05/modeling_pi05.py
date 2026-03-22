@@ -837,7 +837,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        # Eager attention can produce mask/cache shape mismatches on some CPU
+        # transformer versions. Prefer SDPA on CPU and keep eager elsewhere.
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = (  # noqa: SLF001
+            "sdpa" if prefix_embs.device.type == "cpu" else "eager"
+        )
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -898,16 +902,38 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
+        cache_prefix_len = prefix_len
+        try:
+            cache_prefix_len = past_key_values[0][0].shape[-2]
+        except Exception:
+            if hasattr(past_key_values, "get_seq_length"):
+                cache_prefix_len = past_key_values.get_seq_length()
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        # Keep prefix masks aligned with the actual cache length used by attention.
+        if cache_prefix_len == prefix_len:
+            cache_prefix_pad_masks = prefix_pad_masks
+        elif cache_prefix_len < prefix_len:
+            cache_prefix_pad_masks = prefix_pad_masks[:, :cache_prefix_len]
+        else:
+            extra = torch.ones(
+                batch_size,
+                cache_prefix_len - prefix_len,
+                dtype=prefix_pad_masks.dtype,
+                device=prefix_pad_masks.device,
+            )
+            cache_prefix_pad_masks = torch.cat([prefix_pad_masks, extra], dim=1)
+
+        prefix_pad_2d_masks = cache_prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, cache_prefix_len)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        prefix_offsets = torch.sum(cache_prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (  # noqa: SLF001
+            "sdpa" if suffix_embs.device.type == "cpu" else "eager"
+        )
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
