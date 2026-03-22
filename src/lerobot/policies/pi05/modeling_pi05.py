@@ -557,6 +557,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
+        # On CPU with bfloat16, HF SigLIP may initialize with mixed internal dtypes
+        # (e.g., float32 activations against bfloat16 LayerNorm params), which causes
+        # runtime "mixed dtype (CPU)" errors in vision forward. Normalize the vision
+        # tower dtype to bfloat16 so image-path ops stay consistent.
+        if config.device == "cpu" and config.dtype == "bfloat16":
+            self.paligemma_with_expert.paligemma.model.vision_tower.to(dtype=torch.bfloat16)
+
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
@@ -641,6 +648,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
+            # Keep image activations in the same dtype as SigLIP weights.
+            # This avoids CPU mixed-dtype failures in LayerNorm/Linear.
+            vision_dtype = (
+                self.paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.patch_embedding.weight.dtype
+            )
+            if img.dtype != vision_dtype:
+                img = img.to(dtype=vision_dtype)
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
@@ -665,6 +679,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        # Ensure all prefix embeddings have the same dtype before concatenation.
+        target_emb_dtype = embs[0].dtype
+        embs = [x.to(dtype=target_emb_dtype) if x.dtype != target_emb_dtype else x for x in embs]
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -680,6 +698,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks = []
         att_masks = []
 
+        proj_dtype = self.action_in_proj.weight.dtype
+        if noisy_actions.dtype != proj_dtype:
+            noisy_actions = noisy_actions.to(dtype=proj_dtype)
+        if timestep.dtype != proj_dtype:
+            timestep = timestep.to(dtype=proj_dtype)
+
         # Embed timestep using sine-cosine positional encoding
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
@@ -688,7 +712,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             max_period=self.config.max_period,
             device=timestep.device,
         )
-        time_emb = time_emb.type(dtype=timestep.dtype)
+        time_emb = time_emb.type(dtype=proj_dtype)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
@@ -697,6 +721,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         def time_mlp_func(time_emb):
+            if time_emb.dtype != self.time_mlp_in.weight.dtype:
+                time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
             x = self.time_mlp_in(time_emb)
             x = F.silu(x)
             x = self.time_mlp_out(x)
@@ -767,12 +793,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
 
         def action_out_proj_func(suffix_out):
+            proj_dtype = self.action_out_proj.weight.dtype
+            if suffix_out.dtype != proj_dtype:
+                suffix_out = suffix_out.to(dtype=proj_dtype)
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_t = v_t.to(dtype=torch.float32)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
@@ -891,7 +920,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        proj_dtype = self.action_out_proj.weight.dtype
+        if suffix_out.dtype != proj_dtype:
+            suffix_out = suffix_out.to(dtype=proj_dtype)
         return self.action_out_proj(suffix_out)
 
 
