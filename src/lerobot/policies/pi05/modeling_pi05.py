@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import builtins
+import inspect
 import logging
 import math
 from collections import deque
@@ -56,6 +57,36 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+
+
+def _module_supports_cond_arg(module: nn.Module) -> bool:
+    try:
+        return "cond" in inspect.signature(module.forward).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_norm_with_optional_cond(
+    norm_layer: nn.Module, hidden_states: Tensor, cond: Tensor | None
+) -> tuple[Tensor, Tensor | None]:
+    if _module_supports_cond_arg(norm_layer):
+        norm_out = norm_layer(hidden_states, cond=cond)
+    else:
+        norm_out = norm_layer(hidden_states)
+
+    if isinstance(norm_out, tuple):
+        return norm_out
+    return norm_out, None
+
+
+def _supports_adarms_runtime() -> bool:
+    if modeling_gemma is None:
+        return False
+    try:
+        has_cond = "cond" in inspect.signature(modeling_gemma.GemmaRMSNorm.forward).parameters
+    except (TypeError, ValueError, AttributeError):
+        has_cond = False
+    return has_cond and hasattr(modeling_gemma, "_gated_residual")
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -226,7 +257,7 @@ def compute_layer_complete(
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        hidden_states, gate = _apply_norm_with_optional_cond(layer.input_layernorm, hidden_states, adarms_cond[i])  # noqa: PLW2901
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
@@ -275,15 +306,21 @@ def compute_layer_complete(
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
-        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+        if gates[i] is None:
+            out_emb = hidden_states + out_emb
+        else:
+            out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
         after_first_residual = out_emb.clone()
-        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+        out_emb, gate = _apply_norm_with_optional_cond(layer.post_attention_layernorm, out_emb, adarms_cond[i])
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         out_emb = layer.mlp(out_emb)
         # second residual
-        out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+        if gate is None:
+            out_emb = after_first_residual + out_emb
+        else:
+            out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
         outputs_embeds.append(out_emb)
         start_pos = end_pos
     return outputs_embeds
@@ -345,6 +382,7 @@ class PaliGemmaWithExpertModel(
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        model_torch_dtype = "bfloat16" if precision == "bfloat16" else "float32"
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -356,7 +394,7 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
         vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
         vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
-        vlm_config_hf.text_config.torch_dtype = "float32"
+        vlm_config_hf.text_config.torch_dtype = model_torch_dtype
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
@@ -364,7 +402,7 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
-        vlm_config_hf.vision_config.torch_dtype = "float32"
+        vlm_config_hf.vision_config.torch_dtype = model_torch_dtype
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
@@ -375,7 +413,7 @@ class PaliGemmaWithExpertModel(
             num_key_value_heads=action_expert_config.num_kv_heads,
             vocab_size=257152,
             hidden_activation="gelu_pytorch_tanh",
-            torch_dtype="float32",
+            torch_dtype=model_torch_dtype,
             use_adarms=use_adarms[1],
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
@@ -456,6 +494,9 @@ class PaliGemmaWithExpertModel(
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
+            expert_dtype = self.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
+            if inputs_embeds[1].dtype != expert_dtype:
+                inputs_embeds[1] = inputs_embeds[1].to(dtype=expert_dtype)
             suffix_output = self.gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
@@ -508,7 +549,7 @@ class PaliGemmaWithExpertModel(
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    out_emb, _ = _apply_norm_with_optional_cond(models[i].norm, hidden_states, adarms_cond[i])
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
@@ -547,10 +588,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 f"PaliGemma expects square image resolution, invalid resolution: {config.image_resolution}"
             )
 
+        self._adarms_runtime_supported = _supports_adarms_runtime()
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
-            use_adarms=[False, True],
+            use_adarms=[False, self._adarms_runtime_supported],
             precision=config.dtype,
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
@@ -585,10 +627,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         try:
             from transformers.models.siglip import check
 
-            if not check.check_whether_transformers_replace_is_installed_correctly():
+            if self._adarms_runtime_supported and (
+                not check.check_whether_transformers_replace_is_installed_correctly()
+            ):
                 raise ValueError(msg)
         except ImportError:
-            raise ValueError(msg) from None
+            if self._adarms_runtime_supported:
+                raise ValueError(msg) from None
+
+        if not self._adarms_runtime_supported:
+            logging.warning(
+                "PI05 compatibility mode enabled: transformers replacement is unavailable; "
+                "running without AdaRMS expert conditioning and remapping checkpoint norm keys."
+            )
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -1112,32 +1163,41 @@ class PI05Policy(PreTrainedPolicy):
         import re
 
         fixed_state_dict = {}
+        expert_uses_adarms = getattr(self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False)
 
         for key, value in state_dict.items():
             new_key = key
 
-            # Handle layer norm structure changes: .weight -> .dense.weight + .dense.bias
-            # For gemma expert layers
             if re.match(
                 r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight",
                 key,
-            ):
-                # Check if the model actually has adaRMS enabled for the expert
-                expert_uses_adarms = getattr(
-                    self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
-                )
-                if expert_uses_adarms:
-                    logging.warning(f"Skipping layer norm key (adaRMS mismatch): {key}")
-                    continue
+            ) and expert_uses_adarms:
+                new_key = key.replace(".weight", ".dense.weight")
 
-            if re.match(r"paligemma_with_expert\.gemma_expert\.model\.norm\.weight", key):
-                # Check if the model actually has adaRMS enabled for the expert
-                expert_uses_adarms = getattr(
-                    self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
-                )
-                if expert_uses_adarms:
-                    logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
-                    continue
+            if re.match(
+                r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.dense\.weight",
+                key,
+            ) and not expert_uses_adarms:
+                continue
+
+            if re.match(
+                r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.dense\.bias",
+                key,
+            ) and not expert_uses_adarms:
+                continue
+
+            if re.match(r"paligemma_with_expert\.gemma_expert\.model\.norm\.weight", key) and expert_uses_adarms:
+                new_key = key.replace(".weight", ".dense.weight")
+
+            if re.match(
+                r"paligemma_with_expert\.gemma_expert\.model\.norm\.dense\.weight", key
+            ) and not expert_uses_adarms:
+                continue
+
+            if re.match(
+                r"paligemma_with_expert\.gemma_expert\.model\.norm\.dense\.bias", key
+            ) and not expert_uses_adarms:
+                continue
 
             # Handle MLP naming changes for pi05
             # pi05 model expects time_mlp_*, but checkpoint might have action_time_mlp_*
