@@ -59,32 +59,6 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
-# region agent log
-def _agent_debug_log(hypothesis_id: str, location: str, message: str, data: dict):
-    try:
-        import json
-        import time
-
-        with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-
-
-# endregion
-
-
 def _module_supports_cond_arg(module: nn.Module) -> bool:
     try:
         return "cond" in inspect.signature(module.forward).parameters
@@ -966,14 +940,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 v_t = denoise_step_partial_call(x_t)
 
             if not torch.isfinite(v_t).all():
-                # region agent log
-                _agent_debug_log(
-                    "F",
-                    "modeling_pi05.py:1029",
-                    "non-finite denoise velocity detected",
-                    {"step": step, "non_finite_count": int((~torch.isfinite(v_t)).sum().item())},
-                )
-                # endregion
                 logging.warning("PI05 denoise_step produced non-finite values; applying nan_to_num safeguard.")
             v_t = _sanitize_non_finite(v_t, nan=0.0, posinf=1.0, neginf=-1.0)
             x_t = _sanitize_non_finite(x_t + dt * v_t, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -1320,20 +1286,6 @@ class PI05Policy(PreTrainedPolicy):
             # Ensure float32 dtype for consistency
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
-            # region agent log
-            _agent_debug_log(
-                "E",
-                "modeling_pi05.py:1296",
-                "image pre-sanitize stats",
-                {
-                    "feature_key": key,
-                    "dtype": str(img.dtype),
-                    "min": float(torch.nan_to_num(img, nan=0.0).min().item()),
-                    "max": float(torch.nan_to_num(img, nan=0.0).max().item()),
-                    "non_finite_count": int((~torch.isfinite(img)).sum().item()),
-                },
-            )
-            # endregion
 
             # If upstream preprocessing leaks NaN/Inf, sanitize early to prevent full NaN action chunks.
             img = _sanitize_non_finite(img, nan=0.0, posinf=1.0, neginf=0.0)
@@ -1416,14 +1368,6 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
         if not torch.isfinite(actions).all():
-            # region agent log
-            _agent_debug_log(
-                "F",
-                "modeling_pi05.py:1478",
-                "non-finite actions before return",
-                {"non_finite_count": int((~torch.isfinite(actions)).sum().item())},
-            )
-            # endregion
             logging.warning("PI05 produced non-finite action chunk; applying nan_to_num safeguard.")
             actions = _sanitize_non_finite(actions, nan=0.0, posinf=1.0, neginf=-1.0)
 
